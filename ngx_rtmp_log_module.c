@@ -62,6 +62,8 @@ typedef struct {
     time_t                      disk_full_time;
     time_t                      error_log_time;
     ngx_rtmp_log_fmt_t *format;
+// add peer
+    ngx_syslog_peer_t          *syslog_peer;
 } ngx_rtmp_log_t;
 
 
@@ -576,6 +578,8 @@ ngx_rtmp_log_set_log(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     ngx_rtmp_log_t             *log;
     ngx_str_t                  *value, name;
     ngx_uint_t                  n;
+//define peer
+    ngx_syslog_peer_t                 *peer;
 
     value = cf->args->elts;
 
@@ -597,14 +601,33 @@ ngx_rtmp_log_set_log(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     }
 
     ngx_memzero(log, sizeof(*log));
+//check format for syslog
+    if (ngx_strncmp(value[1].data, "syslog:", 7) == 0) {
 
-    lmcf = ngx_rtmp_conf_get_module_main_conf(cf, ngx_rtmp_log_module);
+        peer = ngx_pcalloc(cf->pool, sizeof(ngx_syslog_peer_t));
+        if (peer == NULL) {
+            return NGX_CONF_ERROR;
+        }
+
+        if (ngx_syslog_process_conf(cf, peer) != NGX_CONF_OK) {
+            return NGX_CONF_ERROR;
+        }
+
+        log->syslog_peer = peer;
+
+        goto process_formats;
+    }
+
+
+
 
     log->file = ngx_conf_open_file(cf->cycle, &value[1]);
     if (log->file == NULL) {
         return NGX_CONF_ERROR;
     }
 
+process_formats:
+    lmcf = ngx_rtmp_conf_get_module_main_conf(cf, ngx_rtmp_log_module);
     if (cf->args->nelts == 2) {
         ngx_str_set(&name, "combined");
         lmcf->combined_used = 1;
@@ -922,7 +945,7 @@ ngx_rtmp_log_disconnect(ngx_rtmp_session_t *s, ngx_rtmp_header_t *h,
     ngx_rtmp_log_op_t          *op;
     ngx_uint_t                  n, i;
     u_char                     *line, *p;
-    size_t                      len;
+    size_t                      len, size;
 
     if (s->auto_pushed || s->relay) {
         return NGX_OK;
@@ -948,8 +971,19 @@ ngx_rtmp_log_disconnect(ngx_rtmp_session_t *s, ngx_rtmp_header_t *h,
             len += op->getlen(s, op);
         }
 
+//reserve for peer
+        if (log->syslog_peer) {
+
+            /* length of syslog's PRI and HEADER message parts */
+            len += sizeof("<255>Jan 01 00:00:00 ") - 1
+                   + ngx_cycle->hostname.len + 1
+                   + log->syslog_peer->tag.len + 2;
+            goto alloc_line;
+        }
+
         len += NGX_LINEFEED_SIZE;
 
+alloc_line:
         line = ngx_palloc(s->connection->pool, len);
         if (line == NULL) {
             return NGX_OK;
@@ -960,7 +994,13 @@ ngx_rtmp_log_disconnect(ngx_rtmp_session_t *s, ngx_rtmp_header_t *h,
         for (n = 0; n < log->format->ops->nelts; ++n, ++op) {
             p = op->getdata(s, p, op);
         }
+        if (log->syslog_peer) {
 
+            size = p - line;
+
+            n = ngx_syslog_send(log->syslog_peer, line, size);
+		continue;
+	}
         ngx_linefeed(p);
 
         ngx_rtmp_log_write(s, log, line, p - line);
